@@ -134,7 +134,7 @@ export function OwnerDashboard({
   // Profile state
   const [fullName, setFullName] = useState(user.fullName);
   const [displayAlias, setDisplayAlias] = useState(user.displayAlias);
-  const [phone, setPhone] = useState(user.phone);
+  const [email, setEmail] = useState(user.email ?? '');
   const [address, setAddress] = useState(user.address);
   const [profileImagePreview, setProfileImagePreview] = useState<string | null>(user.profileImage);
   const [uploadedProfileImageUrl, setUploadedProfileImageUrl] = useState<string | null>(user.profileImage);
@@ -454,7 +454,7 @@ export function OwnerDashboard({
       const res = await api.updateProfile({
         fullName,
         displayAlias,
-        phone,
+        email: email.trim() || null,
         address,
         ...(uploadedProfileImageUrl && uploadedProfileImageUrl !== user.profileImage
           ? { profileImageUrl: uploadedProfileImageUrl }
@@ -645,7 +645,9 @@ export function OwnerDashboard({
             )}
             <div className="min-w-0">
               <div className="text-xs font-semibold text-white truncate">{user.fullName}</div>
-              <div className="text-[11px] text-slate-400 truncate">{user.email}</div>
+              <div className="text-[11px] text-slate-400 truncate font-mono tabular-nums">
+                {user.phone || user.email || 'Owner Account'}
+              </div>
             </div>
           </div>
           <button
@@ -1673,23 +1675,23 @@ export function OwnerDashboard({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-semibold text-[#101828] mb-1.5">
-                      Account Email (Private)
+                      Registered Mobile (+91) (Private)
                     </label>
                     <input
-                      type="email"
+                      type="tel"
                       disabled
-                      value={user.email}
-                      className="w-full px-3.5 py-2.5 text-sm bg-slate-100 border border-slate-200 rounded-xl text-slate-500"
+                      value={user.phone || 'Not set'}
+                      className="w-full px-3.5 py-2.5 text-sm font-mono tabular-nums bg-slate-100 border border-slate-200 rounded-xl text-slate-500"
                     />
                   </div>
                   <div>
                     <label className="block text-xs font-semibold text-[#101828] mb-1.5">
-                      Phone Number (Private)
+                      Recovery Email (Optional, Private)
                     </label>
                     <input
-                      type="tel"
-                      value={phone}
-                      onChange={(e) => setPhone(e.target.value)}
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
                       placeholder="Optional private record"
                       className="w-full px-3.5 py-2.5 text-sm bg-[#F8FAFC] border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#2563EB]/25"
                     />

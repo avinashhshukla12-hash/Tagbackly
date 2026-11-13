@@ -126,14 +126,19 @@ export function uploadImageWithProgress(
 }
 
 export const api = {
-  // Auth
-  signup(payload: { fullName: string; email: string; password: string }) {
+  // Auth (+91 Mobile Number + Password)
+  signup(payload: {
+    fullName: string;
+    phone: string;
+    password: string;
+    confirmPassword: string;
+  }) {
     return request<{ token: string; user: UserProfile }>('/api/auth/signup', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
   },
-  login(payload: { email: string; password: string }) {
+  login(payload: { phone: string; password: string }) {
     return request<{ token: string; user: UserProfile }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -142,18 +147,24 @@ export const api = {
   logout() {
     return request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
   },
-  forgotPassword(email: string) {
+  forgotPassword(phone: string) {
     return request<{
       message: string;
       codeIssued: boolean;
+      smsDeliveryConfigured?: boolean;
       verificationCodePreview?: string;
       expiresInMinutes?: number;
     }>('/api/auth/forgot-password', {
       method: 'POST',
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ phone }),
     });
   },
-  resetPassword(payload: { email: string; code: string; newPassword: string }) {
+  resetPassword(payload: {
+    phone: string;
+    code: string;
+    newPassword: string;
+    confirmPassword: string;
+  }) {
     return request<{ message: string }>('/api/auth/reset-password', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -165,7 +176,7 @@ export const api = {
   updateProfile(payload: {
     fullName: string;
     displayAlias: string;
-    phone: string;
+    email?: string | null;
     address: string;
     profileImageUrl?: string | null;
     removeProfileImage?: boolean;

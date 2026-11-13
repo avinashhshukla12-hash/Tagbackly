@@ -21,7 +21,7 @@ db.exec('PRAGMA foreign_keys = ON;');
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
-    email TEXT UNIQUE NOT NULL,
+    email TEXT,
     password_hash TEXT NOT NULL,
     full_name TEXT NOT NULL,
     display_alias TEXT NOT NULL,
@@ -35,7 +35,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS password_resets (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
-    email TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
     reset_code TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     used INTEGER NOT NULL DEFAULT 0,
@@ -132,6 +133,44 @@ ensureColumn('users', 'profile_image', 'TEXT');
 ensureColumn('items', 'reward_type', "TEXT NOT NULL DEFAULT 'none'");
 ensureColumn('items', 'reward_description', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('messages', 'read_status', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('password_resets', 'phone', "TEXT NOT NULL DEFAULT ''");
+
+// Safely migrate legacy users table where email had NOT NULL / inline UNIQUE constraint
+const userCols = db.prepare('PRAGMA table_info(users)').all() as Array<{
+  name: string;
+  notnull: number;
+}>;
+const emailCol = userCols.find((c) => c.name === 'email');
+if (emailCol && emailCol.notnull === 1) {
+  db.exec('PRAGMA foreign_keys = OFF;');
+  db.exec(`
+    BEGIN TRANSACTION;
+    CREATE TABLE users_migrated (
+      id TEXT PRIMARY KEY,
+      email TEXT,
+      password_hash TEXT NOT NULL,
+      full_name TEXT NOT NULL,
+      display_alias TEXT NOT NULL,
+      profile_image TEXT,
+      phone TEXT NOT NULL DEFAULT '',
+      address TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO users_migrated (id, email, password_hash, full_name, display_alias, profile_image, phone, address, created_at, updated_at)
+    SELECT id, NULLIF(TRIM(email), ''), password_hash, full_name, display_alias, profile_image, COALESCE(phone, ''), COALESCE(address, ''), created_at, updated_at
+    FROM users;
+    DROP TABLE users;
+    ALTER TABLE users_migrated RENAME TO users;
+    COMMIT;
+  `);
+  db.exec('PRAGMA foreign_keys = ON;');
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone != '';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL AND email != '';
+`);
 
 // Migrate legacy lowercase statuses from Part 1 to Part 2 uppercase statuses
 db.exec(`

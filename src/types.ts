@@ -21,7 +21,7 @@ export type RewardType = (typeof REWARD_TYPES)[number];
 
 export interface UserProfile {
   id: string;
-  email: string;
+  email: string | null;
   fullName: string;
   displayAlias: string;
   profileImage: string | null;
