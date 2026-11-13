@@ -1,0 +1,8 @@
+{
+  "name": "TAGBACKLY",
+  "description": "Scan. Connect. Return. A privacy-first QR Lost & Found platform helping people reunite with lost essentials.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
