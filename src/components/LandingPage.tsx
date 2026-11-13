@@ -3,6 +3,7 @@ import { ArrowRight, Camera, Globe, Lock, QrCode, Search, ShieldCheck, X } from 
 import { motion } from 'motion/react';
 import { useLanguage } from '../lib/i18n';
 import { ITEM_CATEGORIES } from '../types';
+import { LandingVisual } from './LandingVisuals';
 import { PWAInstallButton } from './PWAInstallButton';
 import { QrScannerModal } from './QrScannerModal';
 
@@ -199,12 +200,7 @@ export function LandingPage({
               className="lg:col-span-6"
             >
               <div className="relative h-full min-h-[300px] lg:min-h-[440px] rounded-2xl overflow-hidden border border-slate-200 bg-[#101828]">
-                <img
-                  src="/src/assets/images/hero_tagbackly_showcase_1794551249269.jpg"
-                  alt="Everyday personal essentials with engraved QR recovery tag on slate stone"
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover"
-                />
+                <LandingVisual variant="hero" />
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#101828]/85 via-[#101828]/35 to-transparent p-6">
                   <p className="text-xs font-medium text-slate-200">
                     Unique QR recovery tags for wallets, bags, electronics, keys, and documents.
@@ -231,12 +227,7 @@ export function LandingPage({
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
               <div className="lg:col-span-6 border border-slate-200 rounded-2xl overflow-hidden bg-[#F8FAFC] flex flex-col">
                 <div className="aspect-[4/3] w-full overflow-hidden bg-slate-100">
-                  <img
-                    src="/src/assets/images/laptop_bag_qr_tag_1794551251092.jpg"
-                    alt="Commuter backpack handle with dark navy anodized QR luggage tag"
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover"
-                  />
+                  <LandingVisual variant="step1" />
                 </div>
                 <div className="p-7 flex-1 flex flex-col justify-between">
                   <div>
@@ -253,12 +244,7 @@ export function LandingPage({
               <div className="lg:col-span-6 grid grid-cols-1 gap-8">
                 <div className="border border-slate-200 rounded-2xl overflow-hidden bg-[#F8FAFC] grid grid-cols-1 sm:grid-cols-5">
                   <div className="sm:col-span-2 aspect-[4/3] sm:aspect-auto bg-slate-100">
-                    <img
-                      src="/src/assets/images/lost_wallet_tag_1794551250451.jpg"
-                      alt="Minimalist leather wallet beside brushed steel QR recovery card"
-                      referrerPolicy="no-referrer"
-                      className="w-full h-full object-cover"
-                    />
+                    <LandingVisual variant="step2" />
                   </div>
                   <div className="sm:col-span-3 p-6 flex flex-col justify-center">
                     <h3 className="text-lg font-bold text-[#101828] font-display">
@@ -272,12 +258,7 @@ export function LandingPage({
 
                 <div className="border border-slate-200 rounded-2xl overflow-hidden bg-[#F8FAFC] grid grid-cols-1 sm:grid-cols-5">
                   <div className="sm:col-span-2 aspect-[4/3] sm:aspect-auto bg-slate-100">
-                    <img
-                      src="/src/assets/images/camera_keys_qr_tag_1794551251761.jpg"
-                      alt="Rangefinder camera and brass keys with engraved QR recovery fob"
-                      referrerPolicy="no-referrer"
-                      className="w-full h-full object-cover"
-                    />
+                    <LandingVisual variant="step3" />
                   </div>
                   <div className="sm:col-span-3 p-6 flex flex-col justify-center">
                     <h3 className="text-lg font-bold text-[#101828] font-display">
