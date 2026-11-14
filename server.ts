@@ -8,10 +8,11 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { WebSocket, WebSocketServer } from 'ws';
 import { getJwtSecret, uploadsDir } from './server/db.ts';
+import { verifyFirebasePhoneIdToken } from './server/firebaseAdmin.ts';
 import {
+  activeStorageBackend,
   deleteUploadedImage,
   isSafeUploadUrl,
-  isSupabaseConfigured,
   saveUploadedImage,
   store,
   type ItemRow,
@@ -337,7 +338,7 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
-      storage: isSupabaseConfigured ? 'supabase' : 'sqlite',
+      storage: activeStorageBackend,
     });
   });
 
@@ -506,38 +507,16 @@ async function startServer() {
 
       const user = await store.findUserByPhone(phone);
       if (!user) {
-        res.json({
-          message:
-            'If an account matches this +91 mobile number, a 6-digit verification code has been issued.',
-          codeIssued: false,
-          smsDeliveryConfigured: false,
+        res.status(404).json({
+          error: 'No owner account found with this +91 mobile number.',
         });
         return;
       }
 
-      const code = String(crypto.randomInt(100000, 999999));
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-      const now = nowIso();
-
-      await store.invalidateOpenPasswordResets(user.id);
-      await store.createPasswordReset({
-        id: crypto.randomUUID(),
-        user_id: user.id,
-        email: user.email ?? '',
-        phone: user.phone,
-        reset_code: code,
-        expires_at: expiresAt,
-        used: 0,
-        created_at: now,
-      });
-
       res.json({
-        message:
-          'A 6-digit verification code has been generated for your mobile number. (Firebase SMS OTP is disabled because Firebase setup was declined.)',
-        codeIssued: true,
-        smsDeliveryConfigured: false,
-        verificationCodePreview: code,
-        expiresInMinutes: 15,
+        ok: true,
+        phone: user.phone,
+        message: 'Account verified. Sending SMS OTP via Firebase Phone Auth.',
       });
     }),
   );
@@ -546,15 +525,15 @@ async function startServer() {
     '/api/auth/reset-password',
     asyncRoute(async (req, res) => {
       const phone = normalizeIndianPhone(req.body?.phone);
-      const code = String(req.body?.code ?? '').trim();
+      const idToken = String(req.body?.idToken ?? '').trim();
       const newPassword = String(req.body?.newPassword ?? '');
       const confirmPassword =
         req.body?.confirmPassword !== undefined ? String(req.body.confirmPassword) : undefined;
 
-      if (!phone || !/^\d{6}$/.test(code) || newPassword.length < 8) {
+      if (!phone || !idToken || newPassword.length < 8) {
         res.status(400).json({
           error:
-            'Valid 10-digit +91 mobile number, 6-digit verification code, and password of at least 8 characters are required.',
+            'Valid 10-digit +91 mobile number, SMS OTP verification token, and password of at least 8 characters are required.',
         });
         return;
       }
@@ -563,28 +542,47 @@ async function startServer() {
         return;
       }
 
-      const resetRow = await store.findValidPasswordResetByPhone(phone, code);
-      if (!resetRow) {
-        res.status(400).json({ error: 'Invalid or already used verification code.' });
+      let verifiedPhone: string;
+      try {
+        const verified = await verifyFirebasePhoneIdToken(idToken);
+        verifiedPhone = normalizeIndianPhone(verified.phoneNumber) ?? verified.phoneNumber;
+      } catch (err) {
+        res.status(401).json({
+          error:
+            err instanceof Error
+              ? `SMS OTP verification failed: ${err.message}`
+              : 'Invalid or expired Firebase Phone verification token.',
+        });
         return;
       }
-      if (new Date(resetRow.expires_at).getTime() < Date.now()) {
-        res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
+
+      if (verifiedPhone !== phone) {
+        res.status(403).json({
+          error: 'Verified SMS mobile number does not match the requested account.',
+        });
+        return;
+      }
+
+      const user = await store.findUserByPhone(phone);
+      if (!user) {
+        res.status(404).json({ error: 'Owner account not found.' });
         return;
       }
 
       const passwordHash = bcrypt.hashSync(newPassword, 10);
-      await store.updateUserPassword(resetRow.user_id, passwordHash, nowIso());
-      await store.markPasswordResetUsed(resetRow.id);
+      await store.updateUserPassword(user.id, passwordHash, nowIso());
 
       await createOwnerNotification({
-        userId: resetRow.user_id,
+        userId: user.id,
         type: 'account_activity',
         title: 'Password reset completed',
-        body: 'Your account password was successfully reset using your mobile verification code.',
+        body: 'Your account password was successfully reset using Firebase SMS OTP verification.',
       });
 
-      res.json({ message: 'Password updated successfully. You can now sign in with your mobile number.' });
+      res.json({
+        message:
+          'Password updated successfully via SMS OTP verification. You can now sign in with your mobile number.',
+      });
     }),
   );
 
@@ -1622,7 +1620,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `TAGBACKLY server listening on http://0.0.0.0:${PORT} (storage: ${isSupabaseConfigured ? 'supabase' : 'sqlite'})`,
+      `TAGBACKLY server listening on http://0.0.0.0:${PORT} (storage: ${activeStorageBackend})`,
     );
   });
 }

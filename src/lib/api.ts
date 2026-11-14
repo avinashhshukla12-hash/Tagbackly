@@ -149,11 +149,9 @@ export const api = {
   },
   forgotPassword(phone: string) {
     return request<{
+      ok: boolean;
+      phone: string;
       message: string;
-      codeIssued: boolean;
-      smsDeliveryConfigured?: boolean;
-      verificationCodePreview?: string;
-      expiresInMinutes?: number;
     }>('/api/auth/forgot-password', {
       method: 'POST',
       body: JSON.stringify({ phone }),
@@ -161,7 +159,7 @@ export const api = {
   },
   resetPassword(payload: {
     phone: string;
-    code: string;
+    idToken: string;
     newPassword: string;
     confirmPassword: string;
   }) {

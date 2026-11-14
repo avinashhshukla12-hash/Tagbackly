@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import type { ConfirmationResult } from 'firebase/auth';
 import {
   AlertCircle,
   ArrowLeft,
@@ -6,13 +7,18 @@ import {
   Eye,
   EyeOff,
   Globe,
-  Info,
   KeyRound,
   Phone,
   ShieldCheck,
   UserPlus,
 } from 'lucide-react';
 import { api, setStoredToken } from '../lib/api';
+import {
+  clearPhoneRecaptcha,
+  firebaseAuth,
+  formatFirebasePhoneAuthError,
+  sendFirebasePhoneOtp,
+} from '../lib/firebase';
 import { useLanguage } from '../lib/i18n';
 import type { UserProfile } from '../types';
 
@@ -32,6 +38,8 @@ function sanitizeTenDigits(value: string): string {
   return digits.slice(0, 10);
 }
 
+const RECAPTCHA_CONTAINER_ID = 'tagbackly-recaptcha-container';
+
 export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) {
   const { lang, setLang, t } = useLanguage();
   const [mode, setMode] = useState<AuthMode>(initialMode);
@@ -43,13 +51,19 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
   const [resetStep, setResetStep] = useState<'request' | 'confirm'>('request');
+  const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
   const [resetCode, setResetCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
-  const [codePreviewNotice, setCodePreviewNotice] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    return () => {
+      clearPhoneRecaptcha();
+    };
+  }, []);
 
   const isPhoneValid = mobileDigits.length === 10;
   const signupPasswordsMatch =
@@ -65,11 +79,12 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
     confirmNewPassword.length > 0 && newPassword !== confirmNewPassword;
 
   function switchMode(next: AuthMode) {
+    clearPhoneRecaptcha();
     setMode(next);
     setError(null);
     setStatusMessage(null);
-    setCodePreviewNotice(null);
     setResetStep('request');
+    setConfirmationResult(null);
     setPassword('');
     setConfirmPassword('');
     setNewPassword('');
@@ -122,11 +137,9 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
     }
   }
 
-  async function handleRequestReset(e: React.FormEvent) {
-    e.preventDefault();
+  async function triggerSmsOtp() {
     setError(null);
     setStatusMessage(null);
-    setCodePreviewNotice(null);
 
     if (!isPhoneValid) {
       setError('Please enter a valid 10-digit +91 mobile number.');
@@ -135,19 +148,22 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
 
     setSubmitting(true);
     try {
-      const res = await api.forgotPassword(`+91${mobileDigits}`);
-      setStatusMessage(res.message);
-      if (res.verificationCodePreview) {
-        setCodePreviewNotice(
-          `Server verification code: ${res.verificationCodePreview} (valid ${res.expiresInMinutes ?? 15} min)`,
-        );
-      }
+      const normalizedPhone = `+91${mobileDigits}`;
+      await api.forgotPassword(normalizedPhone);
+      const result = await sendFirebasePhoneOtp(normalizedPhone, RECAPTCHA_CONTAINER_ID);
+      setConfirmationResult(result);
       setResetStep('confirm');
+      setStatusMessage(`6-digit SMS OTP sent to ${normalizedPhone}.`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not initiate password reset.');
+      setError(formatFirebasePhoneAuthError(err));
     } finally {
       setSubmitting(false);
     }
+  }
+
+  async function handleRequestReset(e: React.FormEvent) {
+    e.preventDefault();
+    await triggerSmsOtp();
   }
 
   async function handleConfirmReset(e: React.FormEvent) {
@@ -155,8 +171,12 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
     setError(null);
     setStatusMessage(null);
 
-    if (!isPhoneValid) {
-      setError('Please enter a valid 10-digit +91 mobile number.');
+    if (!isPhoneValid || !confirmationResult) {
+      setError('Please request a fresh SMS OTP first.');
+      return;
+    }
+    if (resetCode.trim().length !== 6) {
+      setError('Please enter the 6-digit SMS OTP code.');
       return;
     }
     if (newPassword.length < 8) {
@@ -170,21 +190,27 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
 
     setSubmitting(true);
     try {
+      const credential = await confirmationResult.confirm(resetCode.trim());
+      const idToken = await credential.user.getIdToken();
       const res = await api.resetPassword({
         phone: `+91${mobileDigits}`,
-        code: resetCode.trim(),
+        idToken,
         newPassword,
         confirmPassword: confirmNewPassword,
       });
+
+      await firebaseAuth.signOut().catch(() => {});
+      clearPhoneRecaptcha();
+      setConfirmationResult(null);
       setMode('login');
+      setResetStep('request');
       setPassword('');
       setResetCode('');
       setNewPassword('');
       setConfirmNewPassword('');
-      setCodePreviewNotice(null);
       setStatusMessage(res.message);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Password reset failed.');
+      setError(formatFirebasePhoneAuthError(err));
     } finally {
       setSubmitting(false);
     }
@@ -293,12 +319,6 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
             </div>
           )}
 
-          {codePreviewNotice && (
-            <div className="mb-5 p-3.5 rounded-xl bg-[#2563EB]/10 border border-[#2563EB]/20 text-xs font-mono text-[#101828]">
-              {codePreviewNotice}
-            </div>
-          )}
-
           {mode !== 'forgot' ? (
             <form onSubmit={handleLoginOrSignup} className="space-y-4">
               {mode === 'signup' && (
@@ -382,7 +402,9 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
                       type="button"
                       onClick={() => setShowConfirmPassword((v) => !v)}
                       className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                      aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'}
+                      aria-label={
+                        showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'
+                      }
                     >
                       {showConfirmPassword ? (
                         <EyeOff className="w-4 h-4" />
@@ -432,26 +454,49 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
             </form>
           ) : resetStep === 'request' ? (
             <form onSubmit={handleRequestReset} className="space-y-4">
-              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-900 flex items-start gap-2 leading-relaxed">
-                <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                <span>{t('smsOtpUnavailableNotice')}</span>
-              </div>
-
               {renderMobileInput()}
+
+              <p className="text-[11px] text-slate-500 leading-relaxed">{t('smsOtpNotice')}</p>
 
               <button
                 type="submit"
                 disabled={submitting || !isPhoneValid}
                 className="w-full py-3 px-4 text-sm font-semibold text-white bg-[#101828] hover:bg-slate-800 disabled:opacity-50 rounded-xl transition-colors"
               >
-                {submitting ? 'Generating code...' : t('sendResetCodeBtn')}
+                {submitting ? 'Sending SMS OTP...' : t('sendResetCodeBtn')}
               </button>
             </form>
           ) : (
             <form onSubmit={handleConfirmReset} className="space-y-4">
+              <div className="flex items-center justify-between text-xs text-slate-600 bg-[#F8FAFC] border border-slate-200 rounded-xl px-3.5 py-2.5">
+                <span className="font-mono font-semibold text-[#101828]">+91{mobileDigits}</span>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={triggerSmsOtp}
+                    className="font-semibold text-[#2563EB] hover:underline disabled:opacity-50"
+                  >
+                    {t('resendOtpBtn')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearPhoneRecaptcha();
+                      setResetStep('request');
+                      setConfirmationResult(null);
+                      setResetCode('');
+                    }}
+                    className="font-semibold text-slate-500 hover:text-[#101828]"
+                  >
+                    {t('changeNumberBtn')}
+                  </button>
+                </div>
+              </div>
+
               <div>
                 <label className="block text-xs font-semibold text-[#101828] mb-1.5">
-                  6-Digit Verification Code
+                  {t('smsOtpLabel')}
                 </label>
                 <input
                   type="text"
@@ -523,10 +568,13 @@ export function AuthView({ initialMode, onSuccess, onBackHome }: AuthViewProps) 
                 }
                 className="w-full py-3 px-4 text-sm font-semibold text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-50 rounded-xl transition-colors"
               >
-                {submitting ? 'Updating...' : t('updatePasswordBtn')}
+                {submitting ? 'Verifying OTP...' : t('updatePasswordBtn')}
               </button>
             </form>
           )}
+
+          {/* Mount point for Firebase invisible reCAPTCHA */}
+          <div id={RECAPTCHA_CONTAINER_ID} />
 
           <div className="mt-6 pt-5 border-t border-slate-200 text-center text-xs text-slate-600">
             {mode === 'login' && (

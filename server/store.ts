@@ -2,6 +2,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { db, uploadsDir } from './db.ts';
+import {
+  adminDb,
+  adminStorage,
+  firebaseStorageBucketName,
+  isFirestoreConfigured,
+} from './firebaseAdmin.ts';
 
 export interface UserRow {
   id: string;
@@ -123,10 +129,13 @@ const SUPABASE_STORAGE_BUCKET = (process.env.SUPABASE_STORAGE_BUCKET ?? 'tagback
 
 export const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
-async function supabaseRest<T>(
-  pathWithQuery: string,
-  init: RequestInit = {},
-): Promise<T> {
+export const activeStorageBackend: 'firestore' | 'supabase' | 'sqlite' = isFirestoreConfigured
+  ? 'firestore'
+  : isSupabaseConfigured
+    ? 'supabase'
+    : 'sqlite';
+
+async function supabaseRest<T>(pathWithQuery: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set('apikey', SUPABASE_SERVICE_ROLE_KEY);
   headers.set('Authorization', `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`);
@@ -171,6 +180,11 @@ export function isSafeUploadUrl(url: unknown): url is string {
   ) {
     return true;
   }
+  if (
+    url.startsWith(`https://storage.googleapis.com/${firebaseStorageBucketName}/tagbackly/`)
+  ) {
+    return true;
+  }
   return Boolean(parseImageDataUri(url));
 }
 
@@ -180,7 +194,26 @@ export async function saveUploadedImage(dataUri: string): Promise<string | null>
 
   const filename = `${crypto.randomUUID()}.${parsed.ext}`;
 
-  if (isSupabaseConfigured) {
+  if (activeStorageBackend === 'firestore') {
+    if (adminStorage) {
+      try {
+        const bucket = adminStorage.bucket(firebaseStorageBucketName);
+        const objectPath = `tagbackly/${filename}`;
+        const file = bucket.file(objectPath);
+        await file.save(parsed.buffer, {
+          contentType: parsed.mime,
+          resumable: false,
+        });
+        await file.makePublic();
+        return `https://storage.googleapis.com/${firebaseStorageBucketName}/${objectPath}`;
+      } catch {
+        // Fall back to storing validated compressed data URI directly in Firestore if Storage bucket is unavailable
+      }
+    }
+    return dataUri;
+  }
+
+  if (activeStorageBackend === 'supabase') {
     try {
       const uploadRes = await fetch(
         `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_STORAGE_BUCKET)}/${filename}`,
@@ -199,7 +232,7 @@ export async function saveUploadedImage(dataUri: string): Promise<string | null>
         return `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_STORAGE_BUCKET)}/${filename}`;
       }
     } catch {
-      // Fall back to storing validated compressed data URI so images survive Render restarts even without a Storage bucket
+      // Fall back to storing validated compressed data URI so images survive Render restarts
     }
     return dataUri;
   }
@@ -211,12 +244,29 @@ export async function saveUploadedImage(dataUri: string): Promise<string | null>
 
 export async function deleteUploadedImage(photoUrl: string | null): Promise<void> {
   if (!photoUrl) return;
+
   if (photoUrl.startsWith('/uploads/')) {
     const safeName = path.basename(photoUrl);
     const fullPath = path.join(uploadsDir, safeName);
     if (fs.existsSync(fullPath)) {
       try {
         fs.unlinkSync(fullPath);
+      } catch {
+        // Ignore cleanup error
+      }
+    }
+    return;
+  }
+
+  const firebasePrefix = `https://storage.googleapis.com/${firebaseStorageBucketName}/tagbackly/`;
+  if (adminStorage && photoUrl.startsWith(firebasePrefix)) {
+    const filename = photoUrl.slice(firebasePrefix.length);
+    if (filename && !filename.includes('/')) {
+      try {
+        await adminStorage
+          .bucket(firebaseStorageBucketName)
+          .file(`tagbackly/${filename}`)
+          .delete({ ignoreNotFound: true });
       } catch {
         // Ignore cleanup error
       }
@@ -245,9 +295,26 @@ export async function deleteUploadedImage(photoUrl: string | null): Promise<void
   }
 }
 
+async function deleteFirestoreRefs(
+  refs: FirebaseFirestore.DocumentReference[],
+): Promise<void> {
+  if (!adminDb || refs.length === 0) return;
+  for (let i = 0; i < refs.length; i += 400) {
+    const batch = adminDb.batch();
+    for (const ref of refs.slice(i, i + 400)) {
+      batch.delete(ref);
+    }
+    await batch.commit();
+  }
+}
+
 export const store = {
   async findUserById(id: string): Promise<UserRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!.collection('users').doc(id).get();
+      return snap.exists ? (snap.data() as UserRow) : undefined;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<UserRow[]>(
         `users?id=eq.${encodeURIComponent(id)}&select=*&limit=1`,
       );
@@ -257,7 +324,15 @@ export const store = {
   },
 
   async findUserByPhone(phone: string): Promise<UserRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('users')
+        .where('phone', '==', phone)
+        .limit(1)
+        .get();
+      return snap.empty ? undefined : (snap.docs[0].data() as UserRow);
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<UserRow[]>(
         `users?phone=eq.${encodeURIComponent(phone)}&select=*&limit=1`,
       );
@@ -268,7 +343,15 @@ export const store = {
 
   async findUserByEmail(email: string): Promise<UserRow | undefined> {
     if (!email) return undefined;
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('users')
+        .where('email', '==', email)
+        .limit(1)
+        .get();
+      return snap.empty ? undefined : (snap.docs[0].data() as UserRow);
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<UserRow[]>(
         `users?email=eq.${encodeURIComponent(email)}&select=*&limit=1`,
       );
@@ -278,7 +361,11 @@ export const store = {
   },
 
   async createUser(input: UserRow): Promise<UserRow> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('users').doc(input.id).set(input);
+      return input;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<UserRow[]>('users', {
         method: 'POST',
         headers: { Prefer: 'return=representation' },
@@ -315,15 +402,16 @@ export const store = {
       updated_at: string;
     },
   ): Promise<UserRow> {
-    if (isSupabaseConfigured) {
-      const rows = await supabaseRest<UserRow[]>(
-        `users?id=eq.${encodeURIComponent(id)}`,
-        {
-          method: 'PATCH',
-          headers: { Prefer: 'return=representation' },
-          body: JSON.stringify(patch),
-        },
-      );
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('users').doc(id).update(patch);
+      return (await this.findUserById(id))!;
+    }
+    if (activeStorageBackend === 'supabase') {
+      const rows = await supabaseRest<UserRow[]>(`users?id=eq.${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=representation' },
+        body: JSON.stringify(patch),
+      });
       return rows[0];
     }
     db.prepare(`
@@ -343,7 +431,14 @@ export const store = {
   },
 
   async updateUserPassword(id: string, passwordHash: string, updatedAt: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!
+        .collection('users')
+        .doc(id)
+        .update({ password_hash: passwordHash, updated_at: updatedAt });
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(`users?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH',
         body: JSON.stringify({ password_hash: passwordHash, updated_at: updatedAt }),
@@ -358,7 +453,36 @@ export const store = {
   },
 
   async deleteUser(id: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const firestore = adminDb!;
+      const [resetsSnap, notifsSnap, convsSnap, itemsSnap] = await Promise.all([
+        firestore.collection('password_resets').where('user_id', '==', id).get(),
+        firestore.collection('notifications').where('user_id', '==', id).get(),
+        firestore.collection('conversations').where('owner_id', '==', id).get(),
+        firestore.collection('items').where('owner_id', '==', id).get(),
+      ]);
+
+      const refsToDelete: FirebaseFirestore.DocumentReference[] = [
+        ...resetsSnap.docs.map((d) => d.ref),
+        ...notifsSnap.docs.map((d) => d.ref),
+        ...convsSnap.docs.map((d) => d.ref),
+        ...itemsSnap.docs.map((d) => d.ref),
+        firestore.collection('users').doc(id),
+      ];
+
+      const msgSnaps = await Promise.all(
+        convsSnap.docs.map((c) =>
+          firestore.collection('messages').where('conversation_id', '==', c.id).get(),
+        ),
+      );
+      for (const snap of msgSnaps) {
+        refsToDelete.push(...snap.docs.map((d) => d.ref));
+      }
+
+      await deleteFirestoreRefs(refsToDelete);
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(`users?id=eq.${encodeURIComponent(id)}`, {
         method: 'DELETE',
       });
@@ -368,7 +492,22 @@ export const store = {
   },
 
   async invalidateOpenPasswordResets(userId: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('password_resets')
+        .where('user_id', '==', userId)
+        .get();
+      const openDocs = snap.docs.filter((d) => (d.data() as PasswordResetRow).used === 0);
+      if (openDocs.length > 0) {
+        const batch = adminDb!.batch();
+        for (const doc of openDocs) {
+          batch.update(doc.ref, { used: 1 });
+        }
+        await batch.commit();
+      }
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(
         `password_resets?user_id=eq.${encodeURIComponent(userId)}&used=eq.0`,
         {
@@ -382,7 +521,11 @@ export const store = {
   },
 
   async createPasswordReset(input: PasswordResetRow): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('password_resets').doc(input.id).set(input);
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest('password_resets', {
         method: 'POST',
         body: JSON.stringify(input),
@@ -408,7 +551,17 @@ export const store = {
     phone: string,
     code: string,
   ): Promise<PasswordResetRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('password_resets')
+        .where('phone', '==', phone)
+        .get();
+      return snap.docs
+        .map((d) => d.data() as PasswordResetRow)
+        .filter((r) => r.reset_code === code && r.used === 0)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<PasswordResetRow[]>(
         `password_resets?phone=eq.${encodeURIComponent(phone)}&reset_code=eq.${encodeURIComponent(code)}&used=eq.0&order=created_at.desc&limit=1`,
       );
@@ -424,7 +577,11 @@ export const store = {
   },
 
   async markPasswordResetUsed(id: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('password_resets').doc(id).update({ used: 1 });
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(`password_resets?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH',
         body: JSON.stringify({ used: 1 }),
@@ -435,7 +592,48 @@ export const store = {
   },
 
   async getDashboardStats(ownerId: string): Promise<DashboardStatsData> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const [itemsSnap, convsSnap] = await Promise.all([
+        adminDb!.collection('items').where('owner_id', '==', ownerId).get(),
+        adminDb!.collection('conversations').where('owner_id', '==', ownerId).get(),
+      ]);
+
+      const items = itemsSnap.docs.map((d) => d.data() as ItemRow);
+      const conversations = convsSnap.docs.map((d) => d.data() as ConversationRow);
+      const unblockedConvs = conversations.filter((c) => !c.blocked_by_owner);
+
+      let unreadMessages = 0;
+      if (unblockedConvs.length > 0) {
+        const msgSnaps = await Promise.all(
+          unblockedConvs.map((c) =>
+            adminDb!.collection('messages').where('conversation_id', '==', c.id).get(),
+          ),
+        );
+        for (const snap of msgSnaps) {
+          for (const d of snap.docs) {
+            const m = d.data() as MessageRow;
+            if (m.sender_role === 'finder' && !m.read_status) {
+              unreadMessages += 1;
+            }
+          }
+        }
+      }
+
+      return {
+        totalItems: items.length,
+        safeItems: items.filter((i) => i.status === 'SAFE').length,
+        lostItems: items.filter((i) => i.status === 'LOST').length,
+        foundItems: items.filter((i) => i.status === 'FOUND').length,
+        chattingItems: items.filter((i) => i.status === 'CHATTING').length,
+        returnedItems: items.filter((i) => i.status === 'RETURNED').length,
+        activeConversations: conversations.filter(
+          (c) => c.status === 'active' && !c.blocked_by_owner && !c.blocked_by_finder,
+        ).length,
+        unreadMessages,
+      };
+    }
+
+    if (activeStorageBackend === 'supabase') {
       const [items, conversations] = await Promise.all([
         supabaseRest<Array<{ id: string; status: string }>>(
           `items?owner_id=eq.${encodeURIComponent(ownerId)}&select=id,status`,
@@ -530,7 +728,27 @@ export const store = {
   },
 
   async listItemsByOwner(ownerId: string): Promise<ItemRow[]> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const [itemsSnap, convsSnap] = await Promise.all([
+        adminDb!.collection('items').where('owner_id', '==', ownerId).get(),
+        adminDb!.collection('conversations').where('owner_id', '==', ownerId).get(),
+      ]);
+      const convCounts = new Map<string, number>();
+      for (const d of convsSnap.docs) {
+        const c = d.data() as ConversationRow;
+        if (!c.blocked_by_owner) {
+          convCounts.set(c.item_id, (convCounts.get(c.item_id) ?? 0) + 1);
+        }
+      }
+      return itemsSnap.docs
+        .map((d) => {
+          const item = d.data() as ItemRow;
+          return { ...item, conversation_count: convCounts.get(item.id) ?? 0 };
+        })
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    }
+
+    if (activeStorageBackend === 'supabase') {
       const [items, conversations] = await Promise.all([
         supabaseRest<ItemRow[]>(
           `items?owner_id=eq.${encodeURIComponent(ownerId)}&select=*&order=updated_at.desc`,
@@ -561,7 +779,11 @@ export const store = {
   },
 
   async listItemPhotosByOwner(ownerId: string): Promise<Array<{ photo_url: string | null }>> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!.collection('items').where('owner_id', '==', ownerId).get();
+      return snap.docs.map((d) => ({ photo_url: (d.data() as ItemRow).photo_url ?? null }));
+    }
+    if (activeStorageBackend === 'supabase') {
       return supabaseRest<Array<{ photo_url: string | null }>>(
         `items?owner_id=eq.${encodeURIComponent(ownerId)}&select=photo_url`,
       );
@@ -572,7 +794,16 @@ export const store = {
   },
 
   async getItemByIdForOwner(id: string, ownerId: string): Promise<ItemRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!.collection('items').doc(id).get();
+      if (!snap.exists) return undefined;
+      const item = snap.data() as ItemRow;
+      if (item.owner_id !== ownerId) return undefined;
+      const convSnap = await adminDb!.collection('conversations').where('item_id', '==', id).get();
+      const count = convSnap.docs.filter((d) => !(d.data() as ConversationRow).blocked_by_owner).length;
+      return { ...item, conversation_count: count };
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ItemRow[]>(
         `items?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}&select=*&limit=1`,
       );
@@ -594,7 +825,11 @@ export const store = {
   },
 
   async createItem(input: Omit<ItemRow, 'conversation_count'>): Promise<ItemRow> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('items').doc(input.id).set(input);
+      return { ...input, conversation_count: 0 };
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ItemRow[]>('items', {
         method: 'POST',
         headers: { Prefer: 'return=representation' },
@@ -629,7 +864,13 @@ export const store = {
     ownerId: string,
     patch: Partial<Omit<ItemRow, 'id' | 'owner_id' | 'public_slug' | 'created_at' | 'conversation_count'>>,
   ): Promise<ItemRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const existing = await this.getItemByIdForOwner(id, ownerId);
+      if (!existing) return undefined;
+      await adminDb!.collection('items').doc(id).update(patch);
+      return this.getItemByIdForOwner(id, ownerId);
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ItemRow[]>(
         `items?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`,
         {
@@ -667,7 +908,11 @@ export const store = {
   },
 
   async updateItemStatusSystem(id: string, patch: { status?: string; updated_at: string }): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('items').doc(id).update(patch);
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(`items?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH',
         body: JSON.stringify(patch),
@@ -686,7 +931,26 @@ export const store = {
   },
 
   async deleteItem(id: string, ownerId: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const existing = await this.getItemByIdForOwner(id, ownerId);
+      if (!existing) return;
+      const convSnap = await adminDb!.collection('conversations').where('item_id', '==', id).get();
+      const refsToDelete: FirebaseFirestore.DocumentReference[] = [
+        adminDb!.collection('items').doc(id),
+        ...convSnap.docs.map((d) => d.ref),
+      ];
+      const msgSnaps = await Promise.all(
+        convSnap.docs.map((c) =>
+          adminDb!.collection('messages').where('conversation_id', '==', c.id).get(),
+        ),
+      );
+      for (const snap of msgSnaps) {
+        refsToDelete.push(...snap.docs.map((d) => d.ref));
+      }
+      await deleteFirestoreRefs(refsToDelete);
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(
         `items?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`,
         { method: 'DELETE' },
@@ -697,7 +961,15 @@ export const store = {
   },
 
   async getItemBySlug(slug: string): Promise<ItemRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('items')
+        .where('public_slug', '==', slug)
+        .limit(1)
+        .get();
+      return snap.empty ? undefined : (snap.docs[0].data() as ItemRow);
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ItemRow[]>(
         `items?public_slug=eq.${encodeURIComponent(slug)}&select=*&limit=1`,
       );
@@ -707,7 +979,7 @@ export const store = {
   },
 
   async getPublicItemBySlug(slug: string): Promise<PublicItemRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore' || activeStorageBackend === 'supabase') {
       const item = await this.getItemBySlug(slug);
       if (!item) return undefined;
       const owner = await this.findUserById(item.owner_id);
@@ -751,7 +1023,11 @@ export const store = {
   },
 
   async createNotification(input: NotificationRow): Promise<NotificationRow> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('notifications').doc(input.id).set(input);
+      return input;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<NotificationRow[]>('notifications', {
         method: 'POST',
         headers: { Prefer: 'return=representation' },
@@ -773,11 +1049,23 @@ export const store = {
       input.is_read,
       input.created_at,
     );
-    return db.prepare('SELECT * FROM notifications WHERE id = ?').get(input.id) as unknown as NotificationRow;
+    return db
+      .prepare('SELECT * FROM notifications WHERE id = ?')
+      .get(input.id) as unknown as NotificationRow;
   },
 
   async listNotifications(userId: string): Promise<NotificationRow[]> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('notifications')
+        .where('user_id', '==', userId)
+        .get();
+      return snap.docs
+        .map((d) => d.data() as NotificationRow)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+        .slice(0, 60);
+    }
+    if (activeStorageBackend === 'supabase') {
       return supabaseRest<NotificationRow[]>(
         `notifications?user_id=eq.${encodeURIComponent(userId)}&select=*&order=created_at.desc&limit=60`,
       );
@@ -793,7 +1081,22 @@ export const store = {
   },
 
   async markAllNotificationsRead(userId: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('notifications')
+        .where('user_id', '==', userId)
+        .get();
+      const unread = snap.docs.filter((d) => !(d.data() as NotificationRow).is_read);
+      if (unread.length > 0) {
+        const batch = adminDb!.batch();
+        for (const d of unread) {
+          batch.update(d.ref, { is_read: 1 });
+        }
+        await batch.commit();
+      }
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(
         `notifications?user_id=eq.${encodeURIComponent(userId)}&is_read=eq.0`,
         {
@@ -807,7 +1110,15 @@ export const store = {
   },
 
   async markNotificationRead(id: string, userId: string): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const ref = adminDb!.collection('notifications').doc(id);
+      const snap = await ref.get();
+      if (snap.exists && (snap.data() as NotificationRow).user_id === userId) {
+        await ref.update({ is_read: 1 });
+      }
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(
         `notifications?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
         {
@@ -821,7 +1132,54 @@ export const store = {
   },
 
   async listConversations(ownerId: string): Promise<ConversationWithMetaRow[]> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const [convsSnap, itemsSnap] = await Promise.all([
+        adminDb!.collection('conversations').where('owner_id', '==', ownerId).get(),
+        adminDb!.collection('items').where('owner_id', '==', ownerId).get(),
+      ]);
+      const conversations = convsSnap.docs
+        .map((d) => d.data() as ConversationRow)
+        .sort((a, b) => b.last_message_at.localeCompare(a.last_message_at));
+      if (conversations.length === 0) return [];
+
+      const itemMap = new Map(
+        itemsSnap.docs.map((d) => {
+          const item = d.data() as ItemRow;
+          return [item.id, item] as const;
+        }),
+      );
+
+      const msgSnaps = await Promise.all(
+        conversations.map((c) =>
+          adminDb!.collection('messages').where('conversation_id', '==', c.id).get(),
+        ),
+      );
+
+      return conversations
+        .map((c, idx): ConversationWithMetaRow | null => {
+          const item = itemMap.get(c.item_id);
+          if (!item) return null;
+          const convMsgs = msgSnaps[idx].docs
+            .map((d) => d.data() as MessageRow)
+            .sort((a, b) => b.created_at.localeCompare(a.created_at));
+          const latest = convMsgs[0];
+          const unread = convMsgs.filter((m) => m.sender_role === 'finder' && !m.read_status).length;
+          return {
+            ...c,
+            item_name: item.name,
+            item_slug: item.public_slug,
+            item_status: item.status,
+            item_photo_url: item.photo_url,
+            last_message_body: latest?.body ?? null,
+            last_sender_role: latest?.sender_role ?? null,
+            message_count: convMsgs.length,
+            unread_count: unread,
+          };
+        })
+        .filter((row): row is ConversationWithMetaRow => row !== null);
+    }
+
+    if (activeStorageBackend === 'supabase') {
       const [conversations, items] = await Promise.all([
         supabaseRest<ConversationRow[]>(
           `conversations?owner_id=eq.${encodeURIComponent(ownerId)}&select=*&order=last_message_at.desc`,
@@ -890,7 +1248,13 @@ export const store = {
     convId: string,
     ownerId: string,
   ): Promise<ConversationRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!.collection('conversations').doc(convId).get();
+      if (!snap.exists) return undefined;
+      const conv = snap.data() as ConversationRow;
+      return conv.owner_id === ownerId ? conv : undefined;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ConversationRow[]>(
         `conversations?id=eq.${encodeURIComponent(convId)}&owner_id=eq.${encodeURIComponent(ownerId)}&select=*&limit=1`,
       );
@@ -905,7 +1269,13 @@ export const store = {
     convId: string,
     finderToken: string,
   ): Promise<ConversationRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!.collection('conversations').doc(convId).get();
+      if (!snap.exists) return undefined;
+      const conv = snap.data() as ConversationRow;
+      return conv.finder_token === finderToken ? conv : undefined;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ConversationRow[]>(
         `conversations?id=eq.${encodeURIComponent(convId)}&finder_token=eq.${encodeURIComponent(finderToken)}&select=*&limit=1`,
       );
@@ -920,7 +1290,17 @@ export const store = {
     itemId: string,
     finderToken: string,
   ): Promise<ConversationRow | undefined> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('conversations')
+        .where('item_id', '==', itemId)
+        .get();
+      return snap.docs
+        .map((d) => d.data() as ConversationRow)
+        .filter((c) => c.finder_token === finderToken)
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ConversationRow[]>(
         `conversations?item_id=eq.${encodeURIComponent(itemId)}&finder_token=eq.${encodeURIComponent(finderToken)}&order=created_at.desc&limit=1`,
       );
@@ -934,7 +1314,11 @@ export const store = {
   },
 
   async createConversation(input: ConversationRow): Promise<ConversationRow> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('conversations').doc(input.id).set(input);
+      return input;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<ConversationRow[]>('conversations', {
         method: 'POST',
         headers: { Prefer: 'return=representation' },
@@ -957,7 +1341,9 @@ export const store = {
       input.last_message_at,
       input.created_at,
     );
-    return db.prepare('SELECT * FROM conversations WHERE id = ?').get(input.id) as unknown as ConversationRow;
+    return db
+      .prepare('SELECT * FROM conversations WHERE id = ?')
+      .get(input.id) as unknown as ConversationRow;
   },
 
   async updateConversation(
@@ -966,7 +1352,11 @@ export const store = {
       Pick<ConversationRow, 'status' | 'blocked_by_owner' | 'blocked_by_finder' | 'last_message_at'>
     >,
   ): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('conversations').doc(id).update(patch);
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(`conversations?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH',
         body: JSON.stringify(patch),
@@ -997,7 +1387,16 @@ export const store = {
   },
 
   async listMessages(conversationId: string): Promise<MessageRow[]> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('messages')
+        .where('conversation_id', '==', conversationId)
+        .get();
+      return snap.docs
+        .map((d) => d.data() as MessageRow)
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    }
+    if (activeStorageBackend === 'supabase') {
       return supabaseRest<MessageRow[]>(
         `messages?conversation_id=eq.${encodeURIComponent(conversationId)}&select=*&order=created_at.asc`,
       );
@@ -1008,7 +1407,11 @@ export const store = {
   },
 
   async createMessage(input: MessageRow): Promise<MessageRow> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('messages').doc(input.id).set(input);
+      return input;
+    }
+    if (activeStorageBackend === 'supabase') {
       const rows = await supabaseRest<MessageRow[]>('messages', {
         method: 'POST',
         headers: { Prefer: 'return=representation' },
@@ -1028,11 +1431,31 @@ export const store = {
       input.read_status,
       input.created_at,
     );
-    return db.prepare('SELECT * FROM messages WHERE id = ?').get(input.id) as unknown as MessageRow;
+    return db
+      .prepare('SELECT * FROM messages WHERE id = ?')
+      .get(input.id) as unknown as MessageRow;
   },
 
   async markMessagesRead(conversationId: string, senderRole: 'finder' | 'owner'): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      const snap = await adminDb!
+        .collection('messages')
+        .where('conversation_id', '==', conversationId)
+        .get();
+      const toUpdate = snap.docs.filter((d) => {
+        const m = d.data() as MessageRow;
+        return m.sender_role === senderRole && !m.read_status;
+      });
+      if (toUpdate.length > 0) {
+        const batch = adminDb!.batch();
+        for (const d of toUpdate) {
+          batch.update(d.ref, { read_status: 1 });
+        }
+        await batch.commit();
+      }
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest(
         `messages?conversation_id=eq.${encodeURIComponent(conversationId)}&sender_role=eq.${senderRole}&read_status=eq.0`,
         {
@@ -1056,7 +1479,11 @@ export const store = {
     details: string;
     created_at: string;
   }): Promise<void> {
-    if (isSupabaseConfigured) {
+    if (activeStorageBackend === 'firestore') {
+      await adminDb!.collection('abuse_reports').doc(input.id).set(input);
+      return;
+    }
+    if (activeStorageBackend === 'supabase') {
       await supabaseRest('abuse_reports', {
         method: 'POST',
         body: JSON.stringify(input),
